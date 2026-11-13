@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package com.tracom.lango.proto.v1;
+
+option go_package = "github.com/tracom/lango-backend/gen/proto/v1;langov1";
+option java_multiple_files = true;
+option java_package = "com.tracom.lango.proto.v1";
+
+// Shared contract between the Go backend and the Quarkus worker.
+// Keep this file byte-identical in both repositories.
+
+message TicketWorkflowInput {
+  string ticket_id = 1;                      // Primary Key UUID String
+  string ticket_number = 2;                  // Pattern: <prefix{2-4}><sequence{1bn-9bn}><unixtime>
+  string ticket_type = 3;                    // SERVICE, ERROR, FRAUD, COMPLAINT
+  string merchant_id = 4;                    // Target Merchant UUID (optional for prospect recruitment)
+  string outlet_id = 5;                      // Target Outlet UUID (optional for prospect recruitment)
+  string region_code = 6;                    // Bank Region
+  string branch_code = 7;                    // Bank Branch
+  string srm_user_id = 8;                    // Accountable SRM UUID
+  int64 sla_hours_applied = 9;               // Resolved SLA hours frozen at creation
+  int64 reported_at_epoch_ms = 10;           // UTC creation timestamp in milliseconds
+  repeated int64 escalation_tier_hours = 11; // Gap in hours before Tier 1..N
+}
+
+message PauseSlaSignal {
+  string actor_id = 1;
+  string reason = 2;
+  int64 paused_at_epoch_ms = 3;
+}
+
+message ResumeSlaSignal {
+  string actor_id = 1;
+  int64 resumed_at_epoch_ms = 2;
+}
+
+message StatusTransitionSignal {
+  string new_status = 1;
+  string actor_id = 2;
+  string owner_id = 3;
+  string ownership_route = 4;
+  string remarks = 5;
+  int64 transition_at_epoch_ms = 6;
+}
+
+message TicketWorkflowDiagnostics {
+  string ticket_id = 1;
+  string ticket_number = 2;
+  string current_status = 3;
+  string sla_status = 4;
+  bool is_sla_paused = 5;
+  int64 accumulated_paused_seconds = 6;
+  int64 remaining_sla_seconds = 7;
+  int32 current_escalation_tier = 8;
+}
+
+service TicketInternalCallbackService {
+  rpc RecordSlaBreachAndEscalate (RecordSlaBreachRequest) returns (RecordSlaBreachResponse);
+  rpc SyncPausedSlaDuration (SyncPausedSlaDurationRequest) returns (SyncPausedSlaDurationResponse);
+}
+
+message RecordSlaBreachRequest {
+  string ticket_id = 1;           // UUID String
+  string ticket_number = 2;       // Display Code
+  int32 escalation_tier = 3;      // 0 = SRM initial breach; 1+ = Management tiers
+  string srm_user_id = 4;
+  int64 breached_at_epoch_ms = 5;
+  int64 total_paused_seconds = 6;
+}
+
+message RecordSlaBreachResponse {
+  bool success = 1;
+  string current_ticket_status = 2;
+}
+
+message SyncPausedSlaDurationRequest {
+  string ticket_id = 1;
+  int64 total_paused_seconds = 2;
+  string updated_by_actor_id = 3;
+}
+
+message SyncPausedSlaDurationResponse {
+  bool success = 1;
+}

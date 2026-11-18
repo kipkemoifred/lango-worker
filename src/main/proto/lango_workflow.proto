@@ -82,3 +82,91 @@ message SyncPausedSlaDurationRequest {
 message SyncPausedSlaDurationResponse {
   bool success = 1;
 }
+
+// ---------------------------------------------------------------------------
+// Merchant onboarding (MerchantOnboardingWorkflow on lango-onboarding-tq)
+//
+// The workflow input is NOT a proto message: RecruitMerchant starts the workflow
+// with a JSON map {applicationId, ticketId, ticketNumber, recruitingAgentId,
+// branchCode, regionCode}. Signals, the query and callbacks below are proto.
+// ---------------------------------------------------------------------------
+
+// Sent by the backend after it has validated and stored a reviewer's decision.
+message OnboardingStageDecisionSignal {
+  string stage = 1;                  // Stage the decision was made in (AWAITING_REVIEW, COMPLIANCE_REVIEW, ICT_PROVISIONING, RETURNED_FOR_AMENDMENT)
+  string outcome = 2;                // APPROVE, RETURN, DECLINE
+  string actor_id = 3;
+  string remarks = 4;
+  int64 decided_at_epoch_ms = 5;
+}
+
+// Sent by the backend when the sales agent resubmits a returned application.
+message AmendmentResubmittedSignal {
+  string actor_id = 1;
+  int64 resubmitted_at_epoch_ms = 2;
+}
+
+// Sent by the backend when a ticket is linked to the application, or a linked ticket is resolved.
+message LinkedTicketSignal {
+  string ticket_id = 1;
+  string link_relationship = 2;      // SITE_INSPECTION, CLARIFICATION_AMENDMENT
+  string actor_id = 3;
+}
+
+message OnboardingWorkflowDiagnostics {
+  string application_id = 1;
+  string ticket_id = 2;
+  string ticket_number = 3;
+  string current_stage = 4;
+  int32 amendment_cycle_count = 5;
+  repeated string open_linked_ticket_ids = 6;
+  bool is_stage_clock_paused = 7;
+  int64 next_alarm_epoch_ms = 8;     // 0 when no reminder or deadline is pending
+  int32 stage_escalation_tier = 9;   // -1 = stage not overdue yet; 0 = stage owners alerted; 1+ = management tiers
+  string merchant_id = 10;           // Set once ACTIVATED
+  string mid = 11;                   // Set once ACTIVATED
+  string decline_reason = 12;        // Set once DECLINED
+}
+
+service OnboardingCallbackService {
+  rpc NotifyOnboardingStageOverdue (OnboardingStageOverdueRequest) returns (OnboardingCallbackResponse);
+  rpc DeclineOnboardingApplication (DeclineOnboardingRequest) returns (OnboardingCallbackResponse);
+  rpc ProvisionMerchant (ProvisionMerchantRequest) returns (ProvisionMerchantResponse);
+}
+
+message OnboardingStageOverdueRequest {
+  string application_id = 1;
+  string ticket_number = 2;
+  string stage = 3;
+  int32 escalation_tier = 4;         // 0 = stage owners; 1+ = management tiers
+  string branch_code = 5;
+  string region_code = 6;
+  int64 overdue_at_epoch_ms = 7;
+}
+
+// The worker declines on its own only when the agent did not resubmit in time
+// (AMENDMENT_EXPIRED) or the application was returned too often (MAX_AMENDMENTS_EXCEEDED).
+message DeclineOnboardingRequest {
+  string application_id = 1;
+  string stage = 2;
+  string reason = 3;
+}
+
+message OnboardingCallbackResponse {
+  bool success = 1;
+}
+
+// Backend provisions in TMS / Core Banking, creates the merchant and outlet,
+// and moves the application to ACTIVATED.
+message ProvisionMerchantRequest {
+  string application_id = 1;
+  string ticket_id = 2;
+  string approved_by_actor_id = 3;
+}
+
+message ProvisionMerchantResponse {
+  bool success = 1;
+  string merchant_id = 2;
+  string outlet_id = 3;
+  string mid = 4;
+}

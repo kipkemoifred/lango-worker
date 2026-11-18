@@ -21,5 +21,6 @@ public final class LangoSearchAttributes {
         env.registerSearchAttribute("LangoSlaStatus", IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD);
         env.registerSearchAttribute("LangoSlaDate", IndexedValueType.INDEXED_VALUE_TYPE_DATETIME);
         env.registerSearchAttribute("LangoEscalationTier", IndexedValueType.INDEXED_VALUE_TYPE_INT);
+        env.registerSearchAttribute("LangoOnboardingStage", IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD);
     }
 }

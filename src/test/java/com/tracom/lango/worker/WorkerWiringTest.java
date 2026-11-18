@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.Map;
 
 import jakarta.inject.Inject;
 
@@ -11,11 +12,15 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import com.tracom.lango.proto.v1.OnboardingStageDecisionSignal;
+import com.tracom.lango.proto.v1.ProvisionMerchantRequest;
 import com.tracom.lango.proto.v1.RecordSlaBreachRequest;
 import com.tracom.lango.proto.v1.StatusTransitionSignal;
 import com.tracom.lango.proto.v1.TicketWorkflowInput;
 import com.tracom.lango.worker.testsupport.FakeGoBackend;
+import com.tracom.lango.worker.testsupport.FakeOnboardingBackend;
 import com.tracom.lango.worker.testsupport.LangoSearchAttributes;
+import com.tracom.lango.worker.workflows.MerchantOnboardingWorkflow;
 import com.tracom.lango.worker.workflows.TicketLifecycleWorkflow;
 
 import io.grpc.Server;
@@ -27,16 +32,17 @@ import io.temporal.client.WorkflowStub;
 import io.temporal.testing.TestWorkflowEnvironment;
 
 /**
- * End-to-end inside the real Quarkus app: the worker picks the workflow up from
- * lango-tickets-tq, the real activity bean runs, and its @GrpcClient reaches a
- * fake Go backend on localhost:19090 (see %test config). Temporal itself is the
- * in-memory test server, so no Docker is needed.
+ * End-to-end inside the real Quarkus app: each worker picks its workflow up from
+ * its own queue (lango-tickets-tq, lango-onboarding-tq), the real activity beans
+ * run, and their @GrpcClient reaches a fake Go backend on localhost:19090 (see
+ * %test config). Temporal itself is the in-memory test server, so no Docker is needed.
  */
 @QuarkusTest
 class WorkerWiringTest {
 
     static final int FAKE_BACKEND_PORT = 19090;
     static final FakeGoBackend BACKEND = new FakeGoBackend();
+    static final FakeOnboardingBackend ONBOARDING_BACKEND = new FakeOnboardingBackend();
     static Server backendServer;
 
     @Inject
@@ -47,7 +53,7 @@ class WorkerWiringTest {
 
     @BeforeAll
     static void startFakeBackend() throws IOException {
-        backendServer = ServerBuilder.forPort(FAKE_BACKEND_PORT).addService(BACKEND).build().start();
+        backendServer = ServerBuilder.forPort(FAKE_BACKEND_PORT).addService(BACKEND).addService(ONBOARDING_BACKEND).build().start();
     }
 
     @AfterAll
@@ -82,6 +88,40 @@ class WorkerWiringTest {
 
         workflow.onStatusTransition(StatusTransitionSignal.newBuilder().setNewStatus("CLOSED").build());
         WorkflowStub.fromTyped(workflow).getResult(Void.class);
+    }
+
+    @Test
+    void onboardingRunsOnItsOwnQueueAndProvisionsThroughTheBackend() throws java.util.concurrent.TimeoutException {
+        LangoSearchAttributes.register(testEnv);
+
+        // Started exactly like the Go RecruitMerchant handler: untyped, with a JSON map
+        client.newUntypedWorkflowStub("MerchantOnboardingWorkflow",
+                WorkflowOptions.newBuilder()
+                        .setWorkflowId("onboarding-wiring-1")
+                        .setTaskQueue("lango-onboarding-tq")
+                        .build())
+                .start(Map.of(
+                        "applicationId", "app-wiring-1",
+                        "ticketId", "ticket-wiring-1",
+                        "ticketNumber", "RS10000000021772654400",
+                        "recruitingAgentId", "agent-1",
+                        "branchCode", "001",
+                        "regionCode", "NRB"));
+
+        MerchantOnboardingWorkflow application = client.newWorkflowStub(MerchantOnboardingWorkflow.class,
+                "onboarding-wiring-1");
+        for (String stage : new String[] { "AWAITING_REVIEW", "COMPLIANCE_REVIEW", "ICT_PROVISIONING" }) {
+            application.onStageDecision(OnboardingStageDecisionSignal.newBuilder()
+                    .setStage(stage).setOutcome("APPROVE").setActorId("reviewer-1").build());
+        }
+        WorkflowStub.fromTyped(application).getResult(30, java.util.concurrent.TimeUnit.SECONDS, Void.class);
+
+        assertEquals(1, ONBOARDING_BACKEND.provisions.size(), "provision calls received by fake backend");
+        ProvisionMerchantRequest provision = ONBOARDING_BACKEND.provisions.get(0);
+        assertEquals("app-wiring-1", provision.getApplicationId());
+        assertEquals("ticket-wiring-1", provision.getTicketId());
+        assertEquals("reviewer-1", provision.getApprovedByActorId());
+        assertEquals("ACTIVATED", application.getOnboardingDiagnostics().getCurrentStage());
     }
 
     private static void waitForBreaches(int expected) throws InterruptedException {

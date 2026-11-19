@@ -170,3 +170,99 @@ message ProvisionMerchantResponse {
   string outlet_id = 3;
   string mid = 4;
 }
+
+// ---------------------------------------------------------------------------
+// Site visit cycles (VisitCycleWorkflow on lango-visits-tq)
+//
+// One workflow per site_visits.visit_cycles row, workflow id "visit-cycle-<cycle UUID>".
+// Visit n is due on anchor_date + n * interval_days (n = 0 is the anchor date itself).
+// The workflow continues-as-new after every visit, so it can run for years.
+// ---------------------------------------------------------------------------
+
+message VisitCycleWorkflowInput {
+  string cycle_id = 1;
+  string merchant_id = 2;
+  string outlet_id = 3;
+  string region_code = 4;
+  string branch_code = 5;
+  int32 interval_days = 6;           // resolved_interval_days (backend applies frequency_overrides)
+  string anchor_date = 7;            // ISO date, e.g. "2026-11-18"
+  // Set by the worker when it continues-as-new; the backend leaves these empty.
+  int32 next_visit_index = 8;
+  string last_visit_due_date = 9;
+  string last_visit_outcome = 10;    // COMPLETED, WAIVED, CANCELLED, MISSED
+}
+
+// Sent by the backend once a visit is closed: record submitted, waiver stored, or visit cancelled.
+message VisitOutcomeSignal {
+  string visit_id = 1;
+  string outcome = 2;                // COMPLETED, WAIVED, CANCELLED
+  string actor_id = 3;
+}
+
+// Sent by the backend when frequency_overrides change the resolved interval.
+// Takes effect after the visit that is currently open, if any.
+message VisitFrequencyChangedSignal {
+  int32 interval_days = 1;
+  string anchor_date = 2;            // new anchor; empty keeps the current one
+  string actor_id = 3;
+}
+
+// Sent by the backend when the cycle is deactivated (is_active = false). Ends the workflow;
+// the backend cancels any open visit itself.
+message VisitCycleDeactivatedSignal {
+  string actor_id = 1;
+  string reason = 2;
+}
+
+message VisitCycleDiagnostics {
+  string cycle_id = 1;
+  string merchant_id = 2;
+  string outlet_id = 3;
+  int32 interval_days = 4;
+  string anchor_date = 5;
+  string phase = 6;                  // WAITING_FOR_DUE_DATE, VISIT_OPEN, ENDED
+  string next_due_date = 7;          // due date of the visit being waited for or open
+  string current_visit_id = 8;       // set while VISIT_OPEN
+  string current_window_end_date = 9;
+  string last_visit_due_date = 10;
+  string last_visit_outcome = 11;
+  bool frequency_change_pending = 12;
+}
+
+service VisitCallbackService {
+  rpc ScheduleVisit (ScheduleVisitRequest) returns (ScheduleVisitResponse);
+  rpc RemindVisitDue (RemindVisitDueRequest) returns (VisitCallbackResponse);
+  rpc MarkVisitMissed (MarkVisitMissedRequest) returns (VisitCallbackResponse);
+}
+
+// Backend creates the site_visits.visits row (SCHEDULED) and the SITE_VISIT work item.
+// Must be idempotent on (cycle_id, due_date): a retried call returns the same visit_id.
+message ScheduleVisitRequest {
+  string cycle_id = 1;
+  string merchant_id = 2;
+  string outlet_id = 3;
+  string due_date = 4;               // ISO date
+  string window_end_date = 5;        // ISO date, last day of the window (inclusive)
+}
+
+message ScheduleVisitResponse {
+  bool success = 1;
+  string visit_id = 2;
+}
+
+message RemindVisitDueRequest {
+  string visit_id = 1;
+  string cycle_id = 2;
+  string window_end_date = 3;
+}
+
+message MarkVisitMissedRequest {
+  string visit_id = 1;
+  string cycle_id = 2;
+  string due_date = 3;
+}
+
+message VisitCallbackResponse {
+  bool success = 1;
+}

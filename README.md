@@ -1,6 +1,6 @@
 # Lango Worker (Quarkus · Kotlin & Java 21)
 
-Runs two workflows from the Lango v3.2 spec. All database writes go back to the Go
+Runs three workflows from the Lango v3.2 spec. All database writes go back to the Go
 backend over gRPC.
 
 - **`TicketLifecycleWorkflow`** on `lango-tickets-tq` (spec section 5): counts down each
@@ -9,12 +9,14 @@ backend over gRPC.
 - **`MerchantOnboardingWorkflow`** on `lango-onboarding-tq`: follows a recruitment
   application from `AWAITING_REVIEW` to `ACTIVATED` or `DECLINED` (see
   [Merchant onboarding](#merchant-onboarding)).
+- **`VisitCycleWorkflow`** on `lango-visits-tq`: keeps one merchant outlet's recurring site
+  visits going for as long as the cycle is active (see [Site visit cycles](#site-visit-cycles)).
 
 ```
 src/main/proto/lango_workflow.proto          shared contract (same file as the Go backend)
-src/main/kotlin/.../workflows/               TicketLifecycleWorkflow, MerchantOnboardingWorkflow + Impls
-src/main/java/.../activities/                TicketActivities, OnboardingActivities + Impls (gRPC calls to Go backend)
-src/main/resources/application.properties    task queues, onboarding policy, Temporal + gRPC settings
+src/main/kotlin/.../workflows/               TicketLifecycleWorkflow, MerchantOnboardingWorkflow, VisitCycleWorkflow + Impls
+src/main/java/.../activities/                Ticket-, Onboarding-, VisitActivities + Impls (gRPC calls to Go backend)
+src/main/resources/application.properties    task queues, onboarding + visit policy, Temporal + gRPC settings
 src/test/...                                 automated tests (see below)
 ```
 
@@ -76,6 +78,52 @@ it starts, so a change only affects new applications.
 - Maven 3.9+ (or use the bundled `./mvnw`, which downloads Maven 3.9.11)
 - For manual testing only: the [Temporal CLI](https://docs.temporal.io/cli) (or Docker)
 
+## Site visit cycles
+
+The spec lists "Visit Cycles" as a worker job and defines the data (`site_visits.visit_cycles`,
+`visits`, `visit_records`, `visit_waivers`, `frequency_overrides`), but not the workflow, so
+this is designed here and **the Go backend has to implement its side**.
+
+One workflow runs per `visit_cycles` row (id `visit-cycle-<cycleId>`). The backend starts it,
+for example when `ProvisionMerchant` activates a merchant, and stays the only writer:
+
+```
+wait until the next due date ─▶ ScheduleVisit (backend creates the visit, returns visit_id)
+   ─▶ wait for visitOutcome until the window closes (reminder N days before it closes)
+   ─▶ no outcome: MarkVisitMissed ─▶ continue-as-new with the next visit ─▶ ...
+                                     until cycleDeactivated
+```
+
+- **Fixed schedule.** Visit n is due on `anchor_date + n × interval_days` (n = 0 is the
+  anchor date itself), so a late or missed visit never shifts the ones after it.
+- **Windows.** A visit opens at midnight on its due date (in `lango.visits.zone`) and stays open
+  for `window-days`. `COMPLETED`, `WAIVED` or `CANCELLED` closes it; otherwise it's `MISSED`.
+- **Catching up.** Visits whose whole window is already in the past (an anchor in the past, a
+  worker outage) are skipped, not created and marked missed at once.
+- **Frequency changes** (`frequencyChanged`) take effect straight away while waiting, or after
+  the visit that's open. The next visit is always after the last one.
+- **Runs for years.** Each run handles one visit and then continues-as-new, so the history stays small.
+
+| Contract | Name | Payload |
+|---|---|---|
+| Start | `VisitCycleWorkflow` | `VisitCycleWorkflowInput` (proto): `cycleId`, `merchantId`, `outletId`, `regionCode`, `branchCode`, `intervalDays`, `anchorDate` |
+| Signal | `visitOutcome` | `VisitOutcomeSignal`: `visitId`, `outcome` = `COMPLETED` / `WAIVED` / `CANCELLED`. Outcomes for any other visit are ignored. |
+| Signal | `frequencyChanged` | `VisitFrequencyChangedSignal`: new `intervalDays`, optional new `anchorDate` |
+| Signal | `cycleDeactivated` | `VisitCycleDeactivatedSignal`. Ends the workflow; the backend cancels any open visit. |
+| Query | `getVisitCycleDiagnostics` | `VisitCycleDiagnostics` |
+| Callback | `VisitCallbackService.ScheduleVisit` | backend creates the visit and returns its id. **Must be idempotent on (cycle_id, due_date)**, since a retried call must return the same visit. |
+| Callback | `VisitCallbackService.RemindVisitDue` | window about to close, visit not done |
+| Callback | `VisitCallbackService.MarkVisitMissed` | window closed, backend sets `MISSED` |
+
+**Policy** (`lango.visits.*`, **placeholders until the business confirms them**; read at the
+start of each run, so a change applies from each cycle's next visit):
+
+| Setting | Env var | Default |
+|---|---|---|
+| Window length (days) | `LANGO_VISITS_WINDOW_DAYS` | 7 |
+| Reminder before the window closes (days, 0 = none) | `LANGO_VISITS_REMINDER_DAYS` | 2 |
+| Time zone of due dates | `LANGO_VISITS_ZONE` | `Africa/Nairobi` |
+
 ## 1. Automated tests (start here)
 
 ```bash
@@ -91,7 +139,9 @@ server with **time skipping**, so "wait 40 hours" takes milliseconds.
 | `TicketActivitiesImplTest` (Java) | Every field reaches the Go backend over gRPC; a `success=false` reply or a backend that's down throws a **retryable** error (so Temporal retries instead of losing the alert). |
 | `MerchantOnboardingWorkflowTest` (Kotlin) | Onboarding, started with a plain map exactly like Go: approved at every stage is provisioned and activated; an overdue stage alerts its owners at the deadline and then each tier; an open linked ticket pauses the deadline; return and resubmit go back to review; no resubmission in time, or one return too many, declines via the backend; a reviewer's decline ends it; stale or invalid signals are ignored. |
 | `OnboardingActivitiesImplTest` (Java) | The policy comes from config; every field of the three callbacks reaches the backend; rejections and outages are retryable. |
-| `WorkerWiringTest` (`@QuarkusTest`) | The whole app wired together: each workflow is picked up from its own queue (`lango-tickets-tq`, `lango-onboarding-tq`), the real activity beans run, and their `@GrpcClient` reaches a fake Go backend on port 19090. |
+| `VisitCycleWorkflowTest` (Kotlin) | Visit cycles over months of skipped time: each visit is created at the start of its due date and the cycle carries on across continue-as-new; no outcome means a reminder and then MISSED, without shifting the schedule; a waiver closes a visit; outcomes for other visits are ignored; visits whose window is already over are skipped; a frequency change reschedules, and never reopens the visit just done; deactivation ends the cycle. |
+| `VisitActivitiesImplTest` (Java) | The policy comes from config; every field of the three callbacks reaches the backend; rejections and outages are retryable. |
+| `WorkerWiringTest` (`@QuarkusTest`) | The whole app wired together: each workflow is picked up from its own queue (`lango-tickets-tq`, `lango-onboarding-tq`, `lango-visits-tq`), the real activity beans run, and their `@GrpcClient` reaches a fake Go backend on port 19090. |
 
 To run a single test: `./mvnw test -Dtest=MerchantOnboardingWorkflowTest`
 
@@ -104,7 +154,8 @@ temporal server start-dev \
   --search-attribute LangoRegion=Keyword --search-attribute LangoBranch=Keyword \
   --search-attribute LangoTicketType=Keyword --search-attribute LangoTicketStatus=Keyword \
   --search-attribute LangoSlaStatus=Keyword --search-attribute LangoSlaDate=Datetime \
-  --search-attribute LangoEscalationTier=Int --search-attribute LangoOnboardingStage=Keyword
+  --search-attribute LangoEscalationTier=Int --search-attribute LangoOnboardingStage=Keyword \
+  --search-attribute LangoNextVisitDue=Datetime
 ```
 
 Web UI: http://localhost:8233
@@ -192,7 +243,41 @@ temporal workflow signal --workflow-id onboarding-demo-1 --name stageDecision \
 temporal workflow list --query 'WorkflowType="MerchantOnboardingWorkflow" AND LangoOnboardingStage="ICT_PROVISIONING"'
 ```
 
+**e) Start a visit cycle.** All payloads are protobuf. With today's date as the anchor the first
+visit is due straight away; with tomorrow's, the cycle waits:
+
+```bash
+temporal workflow start --task-queue lango-visits-tq --type VisitCycleWorkflow \
+  --workflow-id visit-cycle-demo-1 \
+  --input-meta encoding=json/protobuf \
+  --input-meta messageType=com.tracom.lango.proto.v1.VisitCycleWorkflowInput \
+  --input '{"cycleId":"demo-cycle-1","merchantId":"merchant-1","outletId":"outlet-1","regionCode":"NRB","branchCode":"001","intervalDays":30,"anchorDate":"2026-11-19"}'
+
+# Check it: phase, next due date, open visit
+temporal workflow query --workflow-id visit-cycle-demo-1 --name getVisitCycleDiagnostics
+
+# Change the frequency (every 14 days from a new anchor)
+temporal workflow signal --workflow-id visit-cycle-demo-1 --name frequencyChanged \
+  --input-meta encoding=json/protobuf --input-meta messageType=com.tracom.lango.proto.v1.VisitFrequencyChangedSignal \
+  --input '{"intervalDays":14,"anchorDate":"2026-11-21","actorId":"admin-1"}'
+
+# Close the open visit (use currentVisitId from the query)
+temporal workflow signal --workflow-id visit-cycle-demo-1 --name visitOutcome \
+  --input-meta encoding=json/protobuf --input-meta messageType=com.tracom.lango.proto.v1.VisitOutcomeSignal \
+  --input '{"visitId":"<currentVisitId>","outcome":"COMPLETED","actorId":"officer-1"}'
+
+# Deactivate the cycle (ends the workflow)
+temporal workflow signal --workflow-id visit-cycle-demo-1 --name cycleDeactivated \
+  --input-meta encoding=json/protobuf --input-meta messageType=com.tracom.lango.proto.v1.VisitCycleDeactivatedSignal \
+  --input '{"actorId":"admin-1","reason":"merchant closed"}'
+
+# Cycles with a visit due by a given time (UTC)
+temporal workflow list --query 'WorkflowType="VisitCycleWorkflow" AND LangoNextVisitDue <= "2026-11-30T00:00:00Z"'
+```
+
 Notes:
+- Without the Go backend, `ScheduleVisit` keeps retrying when a visit falls due, so the cycle
+  stays `WAITING_FOR_DUE_DATE`. Visits that take days or weeks are covered by the automated tests.
 - Without the Go backend, `ProvisionMerchant` keeps retrying and the application stays in
   `ICT_PROVISIONING` (pending activity in the Web UI). With the backend it becomes `ACTIVATED`
   and the workflow ends. Remove a demo with `temporal workflow terminate --workflow-id onboarding-demo-1`.
@@ -218,8 +303,9 @@ Environment variables (same names as the spec's docker-compose / Helm values):
 | `GRPC_CLIENTS_LANGO_GO_BACKEND_HOST` | `localhost` | Go backend internal gRPC host |
 | `GRPC_CLIENTS_LANGO_GO_BACKEND_PORT` | `9090` | Go backend internal gRPC port |
 | `LANGO_ONBOARDING_*` | see [Merchant onboarding](#merchant-onboarding) | Onboarding deadlines and limits |
+| `LANGO_VISITS_*` | see [Site visit cycles](#site-visit-cycles) | Visit window, reminder, time zone |
 
-**Every Temporal namespace** (staging, production) needs all eight `Lango*` search
+**Every Temporal namespace** (staging, production) needs all nine `Lango*` search
 attributes from section 2a created before the worker is deployed, or the workflows fail.
 
 ## Where this differs from the v3.2 spec, and why
@@ -242,15 +328,21 @@ attributes from section 2a created before the worker is deployed, or the workflo
 7. **Onboarding is designed here.** The spec only defines how it's started, its stages and
    roles. The signals, deadlines, callbacks and the new `LangoOnboardingStage` search
    attribute come from this project (see [Merchant onboarding](#merchant-onboarding)).
+8. **Visit cycles are designed here.** The spec only defines the tables and permissions. The
+   workflow, signals, callbacks, the `lango.visits.*` policy and the `LangoNextVisitDue`
+   search attribute come from this project (see [Site visit cycles](#site-visit-cycles)).
 
-## Before deploying onboarding
+## Before deploying onboarding and visit cycles
 
 - **Check the backlog.** Applications Go has already started are waiting on
   `lango-onboarding-tq` and will all run as soon as this worker polls it:
   `temporal workflow list --query 'WorkflowType="MerchantOnboardingWorkflow" AND ExecutionStatus="Running"'`.
   Decide whether to let them run or terminate them first.
-- **Create `LangoOnboardingStage`** (Keyword) in every namespace.
-- **Confirm the policy numbers** with the business.
+- **Create `LangoOnboardingStage`** (Keyword) and **`LangoNextVisitDue`** (Datetime) in every namespace.
+- **Confirm the policy numbers** (onboarding and visits) with the business.
+- **Start cycles for merchants that are already active.** Only new activations start one
+  automatically, so existing `visit_cycles` rows need a one-off script that starts a
+  `VisitCycleWorkflow` for each (id `visit-cycle-<cycleId>`, so running it twice is harmless).
 
 ## Not in this project yet
 
@@ -260,6 +352,9 @@ attributes from section 2a created before the worker is deployed, or the workflo
   `RecruitMerchant`, which the spec currently ignores.
 - **Recruitment ticket SLA.** `RecruitMerchant` creates a ticket with a 72h SLA but starts no
   `TicketLifecycleWorkflow` for it, and sets its SRM to the recruiting agent.
-- **Visit-cycle workflows.** The spec lists "Visit Cycles" as a worker job but doesn't define them.
+- **The Go side of visit cycles:** implement `VisitCallbackService` (with `ScheduleVisit`
+  idempotent on cycle and due date), start a `VisitCycleWorkflow` when a merchant is activated,
+  and send `visitOutcome` (record submitted, waiver stored, visit cancelled), `frequencyChanged`
+  (when `frequency_overrides` change) and `cycleDeactivated`.
 - The Go side of `RecordSlaBreachAndEscalate` (writing the breach and calling the notification
   service) lives in the backend, not here.

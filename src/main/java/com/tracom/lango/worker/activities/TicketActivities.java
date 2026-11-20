@@ -20,6 +20,16 @@ public interface TicketActivities {
             long breachedAtEpochMs,
             long totalPausedSeconds);
 
+    /** The SLA is close to breaching (warning percent of it used): the backend records it and warns the SRM. */
+    @ActivityMethod(name = "RecordSlaWarning")
+    void recordSlaWarning(
+            String ticketId,
+            String ticketNumber,
+            String srmUserId,
+            int warningPercent,
+            long warnedAtEpochMs,
+            long slaDueAtEpochMs);
+
     /** Stores the running total of paused SLA time on the ticket row. */
     @ActivityMethod(name = "SyncPausedDurationToBackend")
     void syncPausedDurationToBackend(String ticketId, long totalPausedSeconds, String actorId);

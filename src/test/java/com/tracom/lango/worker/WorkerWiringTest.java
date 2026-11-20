@@ -6,7 +6,6 @@ import java.io.IOException;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.ZoneId;
-import java.util.Map;
 
 import jakarta.inject.Inject;
 
@@ -15,7 +14,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import com.tracom.lango.proto.v1.OnboardingStageDecisionSignal;
-import com.tracom.lango.proto.v1.ProvisionMerchantRequest;
+import com.tracom.lango.proto.v1.OnboardingWorkflowInput;
+import com.tracom.lango.proto.v1.DeclineOnboardingRequest;
 import com.tracom.lango.proto.v1.RecordSlaBreachRequest;
 import com.tracom.lango.proto.v1.ScheduleVisitRequest;
 import com.tracom.lango.proto.v1.StatusTransitionSignal;
@@ -99,37 +99,37 @@ class WorkerWiringTest {
     }
 
     @Test
-    void onboardingRunsOnItsOwnQueueAndProvisionsThroughTheBackend() throws java.util.concurrent.TimeoutException {
+    void onboardingRunsOnItsOwnQueueAndDeclinesThroughTheBackend() throws java.util.concurrent.TimeoutException {
         LangoSearchAttributes.register(testEnv);
 
-        // Started exactly like the Go RecruitMerchant handler: untyped, with a JSON map
-        client.newUntypedWorkflowStub("MerchantOnboardingWorkflow",
+        MerchantOnboardingWorkflow application = client.newWorkflowStub(MerchantOnboardingWorkflow.class,
                 WorkflowOptions.newBuilder()
                         .setWorkflowId("onboarding-wiring-1")
                         .setTaskQueue("lango-onboarding-tq")
-                        .build())
-                .start(Map.of(
-                        "applicationId", "app-wiring-1",
-                        "ticketId", "ticket-wiring-1",
-                        "ticketNumber", "RS10000000021772654400",
-                        "recruitingAgentId", "agent-1",
-                        "branchCode", "001",
-                        "regionCode", "NRB"));
+                        .build());
+        WorkflowStub.fromTyped(application).start(OnboardingWorkflowInput.newBuilder()
+                .setApplicationId("app-wiring-1")
+                .setTicketId("ticket-wiring-1")
+                .setTicketNumber("RS10000000021772654400")
+                .setRecruitingAgentId("agent-1")
+                .setBranchCode("001")
+                .setRegionCode("NRB")
+                .build());
 
-        MerchantOnboardingWorkflow application = client.newWorkflowStub(MerchantOnboardingWorkflow.class,
-                "onboarding-wiring-1");
-        for (String stage : new String[] { "AWAITING_REVIEW", "COMPLIANCE_REVIEW", "ICT_PROVISIONING" }) {
-            application.onStageDecision(OnboardingStageDecisionSignal.newBuilder()
-                    .setStage(stage).setOutcome("APPROVE").setActorId("reviewer-1").build());
-        }
+        // Returned for amendment and never resubmitted: after the configured window (168h by
+        // default) the real activity bean asks the fake backend to decline it
+        application = client.newWorkflowStub(MerchantOnboardingWorkflow.class, "onboarding-wiring-1");
+        application.onStageDecision(OnboardingStageDecisionSignal.newBuilder()
+                .setStage("AWAITING_REVIEW").setOutcome("RETURN").setActorId("supervisor-1").build());
+        testEnv.sleep(Duration.ofHours(169));
         WorkflowStub.fromTyped(application).getResult(30, java.util.concurrent.TimeUnit.SECONDS, Void.class);
 
-        assertEquals(1, ONBOARDING_BACKEND.provisions.size(), "provision calls received by fake backend");
-        ProvisionMerchantRequest provision = ONBOARDING_BACKEND.provisions.get(0);
-        assertEquals("app-wiring-1", provision.getApplicationId());
-        assertEquals("ticket-wiring-1", provision.getTicketId());
-        assertEquals("reviewer-1", provision.getApprovedByActorId());
-        assertEquals("ACTIVATED", application.getOnboardingDiagnostics().getCurrentStage());
+        assertEquals(1, ONBOARDING_BACKEND.declines.size(), "decline calls received by fake backend");
+        DeclineOnboardingRequest decline = ONBOARDING_BACKEND.declines.get(0);
+        assertEquals("app-wiring-1", decline.getApplicationId());
+        assertEquals("RETURNED_FOR_AMENDMENT", decline.getStage());
+        assertEquals("AMENDMENT_EXPIRED", decline.getReason());
+        assertEquals("DECLINED", application.getOnboardingDiagnostics().getCurrentStage());
     }
 
     @Test

@@ -20,9 +20,10 @@ import java.time.ZoneId
 import java.time.ZoneOffset
 
 /**
- * Keeps one merchant outlet's recurring site visits going: creates each visit on its due
- * date, reminds before its window closes, marks it MISSED if the window closes with no
- * outcome, then moves on to the next one.
+ * Keeps one merchant outlet's recurring site visits going: creates each visit a planning
+ * horizon before its due date (BA DFD-5 5.2, so the officer and merchant can agree a date),
+ * reminds before its window closes, marks it MISSED if the window closes with no outcome,
+ * then moves on to the next one.
  *
  * Bound to the "visits" worker, which polls lango-visits-tq (see application.properties).
  *
@@ -30,6 +31,8 @@ import java.time.ZoneOffset
  *    missed visit never shifts the ones after it.
  *  - Visits whose whole window is already in the past (anchor in the past, worker outage) are
  *    skipped rather than created and marked missed at once.
+ *  - One visit is open at a time: if the horizon is longer than the gap between visits, the
+ *    next visit is created as soon as the current one closes.
  *  - Each run handles one visit and then continues-as-new, so the history stays small even
  *    though a cycle runs for as long as the merchant is active.
  */
@@ -39,7 +42,7 @@ class VisitCycleWorkflowImpl : VisitCycleWorkflow {
     companion object {
         const val TASK_QUEUE = "lango-visits-tq"
 
-        const val WAITING_FOR_DUE_DATE = "WAITING_FOR_DUE_DATE"
+        const val WAITING_TO_SCHEDULE = "WAITING_TO_SCHEDULE"
         const val VISIT_OPEN = "VISIT_OPEN"
         const val ENDED = "ENDED"
 
@@ -72,7 +75,7 @@ class VisitCycleWorkflowImpl : VisitCycleWorkflow {
     private lateinit var policy: VisitPolicy
     private lateinit var zone: ZoneId
 
-    private var phase = WAITING_FOR_DUE_DATE
+    private var phase = WAITING_TO_SCHEDULE
     private var dueDate: LocalDate? = null
     private var currentVisitId = ""
     private var outcome: String? = null
@@ -87,21 +90,22 @@ class VisitCycleWorkflowImpl : VisitCycleWorkflow {
         if (input.regionCode.isNotBlank()) Workflow.upsertTypedSearchAttributes(ATTR_REGION.valueSet(input.regionCode))
         if (input.branchCode.isNotBlank()) Workflow.upsertTypedSearchAttributes(ATTR_BRANCH.valueSet(input.branchCode))
 
-        // 1. Wait for the next visit whose window is still open
+        // 1. Wait until the next visit whose window is still open is within the planning horizon
         val visitIndex = firstOpenVisitIndex(input.nextVisitIndex)
         val due = dueDateOf(visitIndex)
         dueDate = due
+        val scheduleOn = due.minusDays(policy.planningHorizonDays().toLong())
         val windowEndsAtMs = startOfDayMs(due.plusDays(policy.windowDays().toLong()))
         Workflow.upsertTypedSearchAttributes(
             ATTR_NEXT_VISIT_DUE.valueSet(OffsetDateTime.ofInstant(Instant.ofEpochMilli(startOfDayMs(due)), ZoneOffset.UTC))
         )
 
-        phase = WAITING_FOR_DUE_DATE
-        Workflow.await(untilMs(startOfDayMs(due))) { deactivated || pendingFrequency != null }
+        phase = WAITING_TO_SCHEDULE
+        Workflow.await(untilMs(startOfDayMs(scheduleOn))) { deactivated || pendingFrequency != null }
         if (deactivated) return end()
         if (pendingFrequency != null) return continueWithNext(visitIndex, input.lastVisitDueDate, input.lastVisitOutcome)
 
-        // 2. The visit is due: create it and wait for its outcome until the window closes
+        // 2. Create the visit and wait for its outcome until the window closes (it can be done early)
         val windowEndDate = due.plusDays(policy.windowDays() - 1L).toString()
         currentVisitId = activities.scheduleVisit(input.cycleId, input.merchantId, input.outletId, due.toString(), windowEndDate)
         phase = VISIT_OPEN
@@ -156,6 +160,7 @@ class VisitCycleWorkflowImpl : VisitCycleWorkflow {
             .setAnchorDate(input.anchorDate)
             .setPhase(phase)
             .setNextDueDate(dueDate?.toString() ?: "")
+            .setNextScheduleDate(dueDate?.minusDays(policy.planningHorizonDays().toLong())?.toString() ?: "")
             .setCurrentVisitId(currentVisitId)
             .setCurrentWindowEndDate(
                 if (phase == VISIT_OPEN) dueDate?.plusDays(policy.windowDays() - 1L)?.toString() ?: "" else ""

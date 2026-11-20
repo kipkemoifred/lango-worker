@@ -30,7 +30,8 @@ import kotlin.math.abs
  * Visit-cycle logic on Temporal's in-memory server with time skipping, so months of
  * visits take seconds. Activities are replaced by [RecordingVisitActivities].
  *
- * Test policy: 7-day window, reminder 2 days before it closes, Africa/Nairobi dates.
+ * Test policy: created 3 days before due, 7-day window, reminder 2 days before it closes,
+ * Africa/Nairobi dates.
  */
 @Timeout(60)
 class VisitCycleWorkflowTest {
@@ -61,19 +62,22 @@ class VisitCycleWorkflowTest {
     }
 
     @Test
-    fun `each visit is created on its due date and the cycle carries on`() {
-        val d0 = today.plusDays(1)
+    fun `each visit is created a planning horizon before it is due and the cycle carries on`() {
+        val d0 = today.plusDays(10)
         start("c1", anchor = d0, intervalDays = 30)
+        eventually { assertEquals(d0.minusDays(3).toString(), diagnostics("c1").nextScheduleDate) }
 
-        assertTrue(activities.scheduled.isEmpty(), "nothing before the first due date")
+        testEnv.sleep(Duration.ofDays(6))
+        assertTrue(activities.scheduled.isEmpty(), "nothing before the planning horizon")
         for (n in 0..2) {
             val due = d0.plusDays(30L * n)
             testEnv.sleep(Duration.ofDays(if (n == 0) 1 else 30))
             eventually { assertEquals(due.toString(), activities.scheduled.last().dueDate) }
 
             val visit = activities.scheduled.last()
-            assertEquals(due.plusDays(6).toString(), visit.windowEndDate, "7-day window, inclusive end")
-            assertAbout(startOfDayMs(due), visit.atMs, "visit ${n + 1} created at the start of its due date")
+            assertEquals(due.plusDays(6).toString(), visit.windowEndDate, "7-day window from the due date, inclusive end")
+            assertAbout(startOfDayMs(due.minusDays(3)), visit.atMs, "visit ${n + 1} created 3 days before it is due")
+            // done early, before its due date: that still counts
             val run = runId("c1")
             outcome("c1", visit.visitId, "COMPLETED")
             awaitNextRun("c1", run)
@@ -84,7 +88,7 @@ class VisitCycleWorkflowTest {
         assertTrue(activities.reminders.isEmpty() && activities.missed.isEmpty(), "every visit was done in time")
         val d = diagnostics("c1")
         assertEquals("COMPLETED", d.lastVisitOutcome)
-        assertEquals("WAITING_FOR_DUE_DATE", d.phase)
+        assertEquals("WAITING_TO_SCHEDULE", d.phase)
         assertEquals(d0.plusDays(90).toString(), d.nextDueDate)
     }
 
@@ -93,11 +97,12 @@ class VisitCycleWorkflowTest {
         val d0 = today.plusDays(1)
         start("c2", anchor = d0, intervalDays = 30)
 
-        testEnv.sleep(Duration.ofDays(1))
+        // due tomorrow is already inside the 3-day horizon, so it is created at once
         eventually { assertEquals(1, activities.scheduled.size) }
+        assertTrue(activities.scheduled[0].atMs < startOfDayMs(d0), "created before its due date")
         assertEquals("VISIT_OPEN", diagnostics("c2").phase)
 
-        testEnv.sleep(Duration.ofDays(4))
+        testEnv.sleep(Duration.ofDays(5))
         assertTrue(activities.reminders.isEmpty(), "reminder only 2 days before the window closes")
 
         testEnv.sleep(Duration.ofDays(1))
@@ -123,7 +128,6 @@ class VisitCycleWorkflowTest {
     fun `waived visit is neither reminded nor missed`() {
         val d0 = today.plusDays(1)
         start("c3", anchor = d0, intervalDays = 30)
-        testEnv.sleep(Duration.ofDays(1))
         eventually { assertEquals(1, activities.scheduled.size) }
 
         outcome("c3", activities.scheduled[0].visitId, "WAIVED")
@@ -136,7 +140,6 @@ class VisitCycleWorkflowTest {
     @Test
     fun `outcome for a different visit is ignored`() {
         start("c4", anchor = today.plusDays(1), intervalDays = 30)
-        testEnv.sleep(Duration.ofDays(1))
         eventually { assertEquals(1, activities.scheduled.size) }
 
         outcome("c4", "visit-from-another-cycle", "COMPLETED")
@@ -161,23 +164,23 @@ class VisitCycleWorkflowTest {
     fun `frequency change while waiting reschedules from the new anchor and interval`() {
         start("c6", anchor = today.plusDays(10), intervalDays = 90)
         val run = runId("c6")
-        frequency("c6", intervalDays = 14, anchor = today.plusDays(3))
+        frequency("c6", intervalDays = 14, anchor = today.plusDays(5))
         awaitNextRun("c6", run)
 
         eventually {
             val d = diagnostics("c6")
             assertEquals(14, d.intervalDays)
-            assertEquals(today.plusDays(3).toString(), d.nextDueDate)
+            assertEquals(today.plusDays(5).toString(), d.nextDueDate)
+            assertEquals(today.plusDays(2).toString(), d.nextScheduleDate)
         }
-        testEnv.sleep(Duration.ofDays(3))
-        eventually { assertEquals(listOf(today.plusDays(3).toString()), activities.scheduled.map { it.dueDate }) }
+        testEnv.sleep(Duration.ofDays(2))
+        eventually { assertEquals(listOf(today.plusDays(5).toString()), activities.scheduled.map { it.dueDate }) }
     }
 
     @Test
     fun `frequency change during an open visit waits for it and never reopens it`() {
         val d0 = today.plusDays(1)
         start("c7", anchor = d0, intervalDays = 30)
-        testEnv.sleep(Duration.ofDays(1))
         eventually { assertEquals(1, activities.scheduled.size) }
 
         // daily from the same anchor: the new schedule's first date is the visit that is open now
@@ -188,7 +191,6 @@ class VisitCycleWorkflowTest {
         awaitNextRun("c7", run)
         assertEquals(d0.plusDays(1).toString(), diagnostics("c7").nextDueDate)
 
-        testEnv.sleep(Duration.ofDays(1))
         eventually { assertEquals(listOf(d0.toString(), d0.plusDays(1).toString()), activities.scheduled.map { it.dueDate }.distinct()) }
         assertEquals(1, activities.scheduled.count { it.dueDate == d0.toString() }, "the completed visit is not created again")
     }
@@ -202,7 +204,6 @@ class VisitCycleWorkflowTest {
         assertTrue(activities.scheduled.isEmpty())
 
         start("c9", anchor = currentDate().plusDays(1), intervalDays = 30)
-        testEnv.sleep(Duration.ofDays(1))
         eventually { assertEquals(1, activities.scheduled.size) }
         deactivate("c9") // while the visit is open: the backend cancels it, the worker just stops
         awaitEnd("c9")
@@ -301,7 +302,7 @@ data class MissedVisit(val visitId: String, val dueDate: String, val atMs: Long)
  */
 @TemporalActivity(workers = ["unit-test-fakes"])
 class RecordingVisitActivities(
-    private val policy: VisitPolicy = VisitPolicy(7, 2, "Africa/Nairobi")
+    private val policy: VisitPolicy = VisitPolicy(3, 7, 2, "Africa/Nairobi")
 ) : VisitActivities {
 
     val scheduled = CopyOnWriteArrayList<ScheduledVisit>()

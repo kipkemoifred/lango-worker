@@ -5,6 +5,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 import com.tracom.lango.proto.v1.RecordSlaBreachRequest;
 import com.tracom.lango.proto.v1.RecordSlaBreachResponse;
+import com.tracom.lango.proto.v1.RecordSlaWarningRequest;
+import com.tracom.lango.proto.v1.RecordSlaWarningResponse;
 import com.tracom.lango.proto.v1.SyncPausedSlaDurationRequest;
 import com.tracom.lango.proto.v1.SyncPausedSlaDurationResponse;
 import com.tracom.lango.proto.v1.TicketInternalCallbackServiceGrpc;
@@ -16,6 +18,7 @@ public class FakeGoBackend extends TicketInternalCallbackServiceGrpc.TicketInter
 
     public final List<RecordSlaBreachRequest> breaches = new CopyOnWriteArrayList<>();
     public final List<SyncPausedSlaDurationRequest> pauseSyncs = new CopyOnWriteArrayList<>();
+    public final List<RecordSlaWarningRequest> warnings = new CopyOnWriteArrayList<>();
 
     /** When true, the backend answers success=false, like a failed DB write. */
     public volatile boolean rejectRequests = false;
@@ -28,6 +31,14 @@ public class FakeGoBackend extends TicketInternalCallbackServiceGrpc.TicketInter
                 .setSuccess(!rejectRequests)
                 .setCurrentTicketStatus("IN_PROGRESS")
                 .build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void recordSlaWarning(RecordSlaWarningRequest request,
+            StreamObserver<RecordSlaWarningResponse> responseObserver) {
+        warnings.add(request);
+        responseObserver.onNext(RecordSlaWarningResponse.newBuilder().setSuccess(!rejectRequests).build());
         responseObserver.onCompleted();
     }
 

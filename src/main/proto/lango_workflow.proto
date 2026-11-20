@@ -21,6 +21,22 @@ message TicketWorkflowInput {
   int64 sla_hours_applied = 9;               // Resolved SLA hours frozen at creation
   int64 reported_at_epoch_ms = 10;           // UTC creation timestamp in milliseconds
   repeated int64 escalation_tier_hours = 11; // Gap in hours before Tier 1..N
+  // Optional additions (0 / unset keeps the behaviour above):
+  int32 sla_warning_percent = 12;            // Warn once when this % of the SLA is used (BA DFD-2 F20), e.g. 75; 0 = no warning
+  int64 sla_due_at_epoch_ms = 13;            // Deadline the backend computed in business time (BA DFD-2 F04 calendar); 0 = count sla_hours_applied
+  ReopenedTicketState reopened = 14;         // Set only when the backend restarts a ticket reopened after CLOSED
+}
+
+// A ticket reopened after it was CLOSED (BA DFD-2 2.5) starts a new run with the state its closed
+// run ended with. The backend copies these from that run's getWorkflowDiagnostics (or its own
+// records), and only within its reopen window (recommended: 7 days after closure).
+message ReopenedTicketState {
+  int64 remaining_sla_seconds = 1;           // SLA left when it was resolved; the SLA continues, it does not restart
+  bool sla_breached = 2;
+  int32 escalation_tier = 3;                 // Last tier alerted, if breached
+  int64 total_paused_seconds = 4;
+  int32 reopen_count = 5;                    // Reopens so far, before this one
+  bool sla_warning_sent = 6;
 }
 
 message PauseSlaSignal {
@@ -32,6 +48,7 @@ message PauseSlaSignal {
 message ResumeSlaSignal {
   string actor_id = 1;
   int64 resumed_at_epoch_ms = 2;
+  int64 sla_due_at_epoch_ms = 3;             // Optional: new business-time deadline after the pause; 0 = shift the deadline by the paused time
 }
 
 message StatusTransitionSignal {
@@ -41,6 +58,7 @@ message StatusTransitionSignal {
   string ownership_route = 4;
   string remarks = 5;
   int64 transition_at_epoch_ms = 6;
+  int64 sla_due_at_epoch_ms = 7;             // Optional, with new_status REOPENED: new business-time deadline; 0 = continue the remaining SLA
 }
 
 message TicketWorkflowDiagnostics {
@@ -52,11 +70,15 @@ message TicketWorkflowDiagnostics {
   int64 accumulated_paused_seconds = 6;
   int64 remaining_sla_seconds = 7;
   int32 current_escalation_tier = 8;
+  int64 sla_due_at_epoch_ms = 9;     // Deadline while the clock runs; 0 while paused, stopped or breached
+  bool sla_warning_sent = 10;
+  int32 reopen_count = 11;
 }
 
 service TicketInternalCallbackService {
   rpc RecordSlaBreachAndEscalate (RecordSlaBreachRequest) returns (RecordSlaBreachResponse);
   rpc SyncPausedSlaDuration (SyncPausedSlaDurationRequest) returns (SyncPausedSlaDurationResponse);
+  rpc RecordSlaWarning (RecordSlaWarningRequest) returns (RecordSlaWarningResponse);
 }
 
 message RecordSlaBreachRequest {
@@ -73,6 +95,20 @@ message RecordSlaBreachResponse {
   string current_ticket_status = 2;
 }
 
+// The SLA is close to breaching: the backend records it and warns the SRM.
+message RecordSlaWarningRequest {
+  string ticket_id = 1;
+  string ticket_number = 2;
+  string srm_user_id = 3;
+  int32 warning_percent = 4;
+  int64 warned_at_epoch_ms = 5;
+  int64 sla_due_at_epoch_ms = 6;
+}
+
+message RecordSlaWarningResponse {
+  bool success = 1;
+}
+
 message SyncPausedSlaDurationRequest {
   string ticket_id = 1;
   int64 total_paused_seconds = 2;
@@ -86,18 +122,36 @@ message SyncPausedSlaDurationResponse {
 // ---------------------------------------------------------------------------
 // Merchant onboarding (MerchantOnboardingWorkflow on lango-onboarding-tq)
 //
-// The workflow input is NOT a proto message: RecruitMerchant starts the workflow
-// with a JSON map {applicationId, ticketId, ticketNumber, recruitingAgentId,
-// branchCode, regionCode}. Signals, the query and callbacks below are proto.
+// Stages follow the BA data flow diagram DFD-3:
+//   AWAITING_REVIEW (3.2) -> COMPLIANCE_REVIEW (3.3) -> SITE_INSPECTION (3.4)
+//   -> INSPECTION_APPROVAL (3.5) -> ICT_PROVISIONING (3.6) -> ACTIVATED,
+//   plus RETURNED_FOR_AMENDMENT and DECLINED.
+//
 // ---------------------------------------------------------------------------
+
+// Sent by RecruitMerchant to start the workflow (workflow id "onboarding-<application UUID>").
+message OnboardingWorkflowInput {
+  string application_id = 1;         // onboarding_applications UUID
+  string ticket_id = 2;              // origin recruitment ticket UUID
+  string ticket_number = 3;          // Display code
+  string recruiting_agent_id = 4;    // Sales agent UUID
+  string branch_code = 5;
+  string region_code = 6;
+}
 
 // Sent by the backend after it has validated and stored a reviewer's decision.
 message OnboardingStageDecisionSignal {
-  string stage = 1;                  // Stage the decision was made in (AWAITING_REVIEW, COMPLIANCE_REVIEW, ICT_PROVISIONING, RETURNED_FOR_AMENDMENT)
+  string stage = 1;                  // Stage the decision was made in (AWAITING_REVIEW, COMPLIANCE_REVIEW, INSPECTION_APPROVAL, ICT_PROVISIONING, RETURNED_FOR_AMENDMENT)
   string outcome = 2;                // APPROVE, RETURN, DECLINE
   string actor_id = 3;
   string remarks = 4;
   int64 decided_at_epoch_ms = 5;
+  // ICT_PROVISIONING + APPROVE only (DFD-3 F17): the ICT administrator's MID and TID, which the
+  // backend has already stored with the new merchant and outlet. Required for activation.
+  string merchant_id = 6;
+  string outlet_id = 7;
+  string mid = 8;
+  string tid = 9;
 }
 
 // Sent by the backend when the sales agent resubmits a returned application.
@@ -106,11 +160,11 @@ message AmendmentResubmittedSignal {
   int64 resubmitted_at_epoch_ms = 2;
 }
 
-// Sent by the backend when a ticket is linked to the application, or a linked ticket is resolved.
-message LinkedTicketSignal {
-  string ticket_id = 1;
-  string link_relationship = 2;      // SITE_INSPECTION, CLARIFICATION_AMENDMENT
-  string actor_id = 3;
+// Sent by the backend when the sales agent has captured the site inspection (DFD-3 3.4).
+message InspectionSubmittedSignal {
+  string actor_id = 1;
+  string inspection_id = 2;
+  int64 submitted_at_epoch_ms = 3;
 }
 
 message OnboardingWorkflowDiagnostics {
@@ -119,19 +173,19 @@ message OnboardingWorkflowDiagnostics {
   string ticket_number = 3;
   string current_stage = 4;
   int32 amendment_cycle_count = 5;
-  repeated string open_linked_ticket_ids = 6;
-  bool is_stage_clock_paused = 7;
+  reserved 6, 7;                     // removed: linked-ticket pause (inspection is now a stage)
   int64 next_alarm_epoch_ms = 8;     // 0 when no reminder or deadline is pending
   int32 stage_escalation_tier = 9;   // -1 = stage not overdue yet; 0 = stage owners alerted; 1+ = management tiers
   string merchant_id = 10;           // Set once ACTIVATED
   string mid = 11;                   // Set once ACTIVATED
   string decline_reason = 12;        // Set once DECLINED
+  string tid = 13;                   // Set once ACTIVATED
+  int32 inspection_return_count = 14;
 }
 
 service OnboardingCallbackService {
   rpc NotifyOnboardingStageOverdue (OnboardingStageOverdueRequest) returns (OnboardingCallbackResponse);
   rpc DeclineOnboardingApplication (DeclineOnboardingRequest) returns (OnboardingCallbackResponse);
-  rpc ProvisionMerchant (ProvisionMerchantRequest) returns (ProvisionMerchantResponse);
 }
 
 message OnboardingStageOverdueRequest {
@@ -156,26 +210,13 @@ message OnboardingCallbackResponse {
   bool success = 1;
 }
 
-// Backend provisions in TMS / Core Banking, creates the merchant and outlet,
-// and moves the application to ACTIVATED.
-message ProvisionMerchantRequest {
-  string application_id = 1;
-  string ticket_id = 2;
-  string approved_by_actor_id = 3;
-}
-
-message ProvisionMerchantResponse {
-  bool success = 1;
-  string merchant_id = 2;
-  string outlet_id = 3;
-  string mid = 4;
-}
-
 // ---------------------------------------------------------------------------
 // Site visit cycles (VisitCycleWorkflow on lango-visits-tq)
 //
 // One workflow per site_visits.visit_cycles row, workflow id "visit-cycle-<cycle UUID>".
 // Visit n is due on anchor_date + n * interval_days (n = 0 is the anchor date itself).
+// Each visit is created a planning horizon before it is due (BA DFD-5 5.2), so the officer
+// and merchant can agree a date (4.3) before the window opens.
 // The workflow continues-as-new after every visit, so it can run for years.
 // ---------------------------------------------------------------------------
 
@@ -221,13 +262,14 @@ message VisitCycleDiagnostics {
   string outlet_id = 3;
   int32 interval_days = 4;
   string anchor_date = 5;
-  string phase = 6;                  // WAITING_FOR_DUE_DATE, VISIT_OPEN, ENDED
+  string phase = 6;                  // WAITING_TO_SCHEDULE, VISIT_OPEN, ENDED
   string next_due_date = 7;          // due date of the visit being waited for or open
   string current_visit_id = 8;       // set while VISIT_OPEN
   string current_window_end_date = 9;
   string last_visit_due_date = 10;
   string last_visit_outcome = 11;
   bool frequency_change_pending = 12;
+  string next_schedule_date = 13;    // date the next visit is (or was) created, due date minus the planning horizon
 }
 
 service VisitCallbackService {
@@ -236,7 +278,8 @@ service VisitCallbackService {
   rpc MarkVisitMissed (MarkVisitMissedRequest) returns (VisitCallbackResponse);
 }
 
-// Backend creates the site_visits.visits row (SCHEDULED) and the SITE_VISIT work item.
+// Backend creates the site_visits.visits row (SCHEDULED) and the SITE_VISIT work item,
+// a planning horizon before the due date.
 // Must be idempotent on (cycle_id, due_date): a retried call returns the same visit_id.
 message ScheduleVisitRequest {
   string cycle_id = 1;

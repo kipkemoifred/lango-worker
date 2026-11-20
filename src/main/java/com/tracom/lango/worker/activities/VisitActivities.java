@@ -14,7 +14,7 @@ public interface VisitActivities {
     @ActivityMethod(name = "LoadVisitPolicy")
     VisitPolicy loadVisitPolicy();
 
-    /** Creates the visit (SCHEDULED) for this due date and returns its visit id. */
+    /** Creates the visit (SCHEDULED) a planning horizon before this due date and returns its visit id. */
     @ActivityMethod(name = "ScheduleVisit")
     String scheduleVisit(String cycleId, String merchantId, String outletId, String dueDate, String windowEndDate);
 

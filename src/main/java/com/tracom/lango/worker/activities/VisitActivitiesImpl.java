@@ -31,6 +31,9 @@ public class VisitActivitiesImpl implements VisitActivities {
     @GrpcClient("lango-go-backend")
     VisitCallbackServiceGrpc.VisitCallbackServiceBlockingStub goBackendClient;
 
+    @ConfigProperty(name = "lango.visits.planning-horizon-days")
+    int planningHorizonDays;
+
     @ConfigProperty(name = "lango.visits.window-days")
     int windowDays;
 
@@ -42,7 +45,7 @@ public class VisitActivitiesImpl implements VisitActivities {
 
     @Override
     public VisitPolicy loadVisitPolicy() {
-        return new VisitPolicy(windowDays, reminderDaysBeforeWindowEnd, zoneId);
+        return new VisitPolicy(planningHorizonDays, windowDays, reminderDaysBeforeWindowEnd, zoneId);
     }
 
     @Override

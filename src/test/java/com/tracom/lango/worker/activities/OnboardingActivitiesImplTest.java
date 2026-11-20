@@ -13,7 +13,6 @@ import org.junit.jupiter.api.Test;
 
 import com.tracom.lango.proto.v1.OnboardingCallbackServiceGrpc;
 import com.tracom.lango.proto.v1.OnboardingStageOverdueRequest;
-import com.tracom.lango.proto.v1.ProvisionMerchantResponse;
 import com.tracom.lango.worker.testsupport.FakeOnboardingBackend;
 
 import io.grpc.ManagedChannel;
@@ -45,6 +44,8 @@ class OnboardingActivitiesImplTest {
         activities.goBackendClient = OnboardingCallbackServiceGrpc.newBlockingStub(channel);
         activities.reviewDeadlineHours = 24;
         activities.complianceDeadlineHours = 48;
+        activities.inspectionDeadlineHours = 72;
+        activities.inspectionApprovalDeadlineHours = 24;
         activities.ictDeadlineHours = 12;
         activities.amendmentDeadlineHours = 168;
         activities.escalationTierHours = List.of(4L, 8L);
@@ -59,7 +60,7 @@ class OnboardingActivitiesImplTest {
 
     @Test
     void policyComesFromConfig() {
-        assertEquals(new OnboardingPolicy(24, 48, 12, 168, List.of(4L, 8L), 3), activities.loadOnboardingPolicy());
+        assertEquals(new OnboardingPolicy(24, 48, 72, 24, 12, 168, List.of(4L, 8L), 3), activities.loadOnboardingPolicy());
     }
 
     @Test
@@ -89,28 +90,16 @@ class OnboardingActivitiesImplTest {
     }
 
     @Test
-    void provisioningReturnsTheNewMerchant() {
-        ProvisionMerchantResponse r = activities.provisionMerchant("app-1", "ticket-1", "ict-1");
-
-        assertEquals("merchant-app-1", r.getMerchantId());
-        assertEquals("MID-app-1", r.getMid());
-        assertEquals("ticket-1", backend.provisions.get(0).getTicketId());
-        assertEquals("ict-1", backend.provisions.get(0).getApprovedByActorId());
-    }
-
-    @Test
     void backendRejectionThrowsARetryableFailure() {
         backend.rejectRequests = true;
 
         ApplicationFailure failure = assertThrows(ApplicationFailure.class,
-                () -> activities.provisionMerchant("app-1", "ticket-1", "ict-1"));
+                () -> activities.declineApplication("app-1", "RETURNED_FOR_AMENDMENT", "AMENDMENT_EXPIRED"));
         assertEquals("BACKEND_REJECTED", failure.getType());
         assertFalse(failure.isNonRetryable(), "Temporal must retry, not give up");
 
         assertThrows(ApplicationFailure.class,
                 () -> activities.notifyStageOverdue("app-1", "RS1", "AWAITING_REVIEW", 0, "001", "NRB", 0L));
-        assertThrows(ApplicationFailure.class,
-                () -> activities.declineApplication("app-1", "RETURNED_FOR_AMENDMENT", "AMENDMENT_EXPIRED"));
     }
 
     @Test
@@ -118,6 +107,6 @@ class OnboardingActivitiesImplTest {
         server.shutdownNow();
 
         assertThrows(StatusRuntimeException.class,
-                () -> activities.provisionMerchant("app-1", "ticket-1", "ict-1"));
+                () -> activities.declineApplication("app-1", "RETURNED_FOR_AMENDMENT", "AMENDMENT_EXPIRED"));
     }
 }

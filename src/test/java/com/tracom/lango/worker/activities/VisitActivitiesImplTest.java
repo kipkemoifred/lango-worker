@@ -41,6 +41,7 @@ class VisitActivitiesImplTest {
 
         activities = new VisitActivitiesImpl();
         activities.goBackendClient = VisitCallbackServiceGrpc.newBlockingStub(channel);
+        activities.planningHorizonDays = 14;
         activities.windowDays = 7;
         activities.reminderDaysBeforeWindowEnd = 2;
         activities.zoneId = "Africa/Nairobi";
@@ -54,7 +55,7 @@ class VisitActivitiesImplTest {
 
     @Test
     void policyComesFromConfig() {
-        assertEquals(new VisitPolicy(7, 2, "Africa/Nairobi"), activities.loadVisitPolicy());
+        assertEquals(new VisitPolicy(14, 7, 2, "Africa/Nairobi"), activities.loadVisitPolicy());
     }
 
     @Test

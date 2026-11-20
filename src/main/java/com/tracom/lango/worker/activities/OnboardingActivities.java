@@ -1,7 +1,5 @@
 package com.tracom.lango.worker.activities;
 
-import com.tracom.lango.proto.v1.ProvisionMerchantResponse;
-
 import io.temporal.activity.ActivityInterface;
 import io.temporal.activity.ActivityMethod;
 
@@ -30,8 +28,4 @@ public interface OnboardingActivities {
     /** Declines the application when the worker decides it (amendment expired or too many returns). */
     @ActivityMethod(name = "DeclineOnboardingApplication")
     void declineApplication(String applicationId, String stage, String reason);
-
-    /** Provisions in TMS / Core Banking via the backend and moves the application to ACTIVATED. */
-    @ActivityMethod(name = "ProvisionMerchant")
-    ProvisionMerchantResponse provisionMerchant(String applicationId, String ticketId, String approvedByActorId);
 }

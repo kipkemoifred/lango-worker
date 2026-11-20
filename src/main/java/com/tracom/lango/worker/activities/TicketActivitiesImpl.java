@@ -6,6 +6,8 @@ import org.jboss.logging.Logger;
 
 import com.tracom.lango.proto.v1.RecordSlaBreachRequest;
 import com.tracom.lango.proto.v1.RecordSlaBreachResponse;
+import com.tracom.lango.proto.v1.RecordSlaWarningRequest;
+import com.tracom.lango.proto.v1.RecordSlaWarningResponse;
 import com.tracom.lango.proto.v1.SyncPausedSlaDurationRequest;
 import com.tracom.lango.proto.v1.SyncPausedSlaDurationResponse;
 import com.tracom.lango.proto.v1.TicketInternalCallbackServiceGrpc;
@@ -57,6 +59,34 @@ public class TicketActivitiesImpl implements TicketActivities {
                     "BACKEND_REJECTED");
         }
         return response.getCurrentTicketStatus();
+    }
+
+    @Override
+    public void recordSlaWarning(
+            String ticketId,
+            String ticketNumber,
+            String srmUserId,
+            int warningPercent,
+            long warnedAtEpochMs,
+            long slaDueAtEpochMs) {
+
+        LOG.infof("SLA warning: ticketNum=%s at %d%% of its SLA", ticketNumber, warningPercent);
+
+        RecordSlaWarningResponse response = goBackendClient
+                .withDeadlineAfter(CALL_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                .recordSlaWarning(RecordSlaWarningRequest.newBuilder()
+                        .setTicketId(ticketId)
+                        .setTicketNumber(ticketNumber)
+                        .setSrmUserId(srmUserId)
+                        .setWarningPercent(warningPercent)
+                        .setWarnedAtEpochMs(warnedAtEpochMs)
+                        .setSlaDueAtEpochMs(slaDueAtEpochMs)
+                        .build());
+
+        if (!response.getSuccess()) {
+            throw ApplicationFailure.newFailure(
+                    "Backend did not record the SLA warning for " + ticketNumber, "BACKEND_REJECTED");
+        }
     }
 
     @Override

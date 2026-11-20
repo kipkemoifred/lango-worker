@@ -1,6 +1,7 @@
 package com.tracom.lango.worker.workflows
 
 import com.tracom.lango.proto.v1.PauseSlaSignal
+import com.tracom.lango.proto.v1.ReopenedTicketState
 import com.tracom.lango.proto.v1.ResumeSlaSignal
 import com.tracom.lango.proto.v1.StatusTransitionSignal
 import com.tracom.lango.proto.v1.TicketWorkflowInput
@@ -198,7 +199,260 @@ class TicketLifecycleWorkflowTest {
         assertTrue(activities.escalations.isEmpty())
     }
 
+    @Test
+    fun `backend outage after a resume does not hold up the SLA clock`() {
+        activities.backendDown = true
+        val t0 = startTicket("t9", slaHours = 4)
+        testEnv.sleep(Duration.ofHours(1))
+        ticket("t9").pauseSla(PauseSlaSignal.newBuilder().setActorId("officer-1").build())
+        testEnv.sleep(Duration.ofHours(1))
+        ticket("t9").resumeSla(ResumeSlaSignal.newBuilder().setActorId("officer-1").build())
+
+        // 3h of SLA left after the resume at t0+2h: the breach is due at t0+5h, report or no report
+        testEnv.sleep(Duration.ofHours(4))
+        eventually { assertEquals(1, activities.escalations.size) }
+        assertAbout(t0 + 5 * HOUR_MS, activities.escalations[0].atMs, "breach on time despite the outage")
+        assertTrue(activities.pauseSyncs.isEmpty(), "the paused-time report is still failing")
+
+        // Closing waits for the paused total to reach the backend, then ends
+        setStatus("t9", "CLOSED")
+        activities.backendDown = false
+        WorkflowStub.fromTyped(ticket("t9")).getResult(Void::class.java)
+        assertAbout(HOUR_S, activities.pauseSyncs.last().totalPausedSeconds, "the 1h pause reached the backend")
+    }
+
+    @Test
+    fun `diagnostics count down between events and show the deadline`() {
+        val t0 = startTicket("t10", slaHours = 24)
+        eventually { assertTrue(ticket("t10").getWorkflowDiagnostics().slaDueAtEpochMs > 0) }
+        val first = ticket("t10").getWorkflowDiagnostics()
+        assertAbout(t0 + 24 * HOUR_MS, first.slaDueAtEpochMs, "deadline while the clock runs")
+
+        Thread.sleep(2_100) // real time passes with no event in between
+        val later = ticket("t10").getWorkflowDiagnostics()
+        assertTrue(
+            later.remainingSlaSeconds <= first.remainingSlaSeconds - 2,
+            "remaining time counts down: ${first.remainingSlaSeconds} -> ${later.remainingSlaSeconds}"
+        )
+
+        ticket("t10").pauseSla(PauseSlaSignal.newBuilder().setActorId("officer-1").build())
+        eventually { assertEquals(0L, ticket("t10").getWorkflowDiagnostics().slaDueAtEpochMs, "no deadline while paused") }
+        closeAndAwait("t10")
+    }
+
+    // --- BA DFD-2: warning before a breach (F20) ---
+
+    @Test
+    fun `warns the SRM once at the warning point`() {
+        val t0 = startTicketWith("t11") { setSlaHoursApplied(24).setSlaWarningPercent(75) }
+
+        testEnv.sleep(Duration.ofHours(17))
+        assertTrue(activities.warnings.isEmpty(), "no warning before 75% of 24h (18h)")
+        testEnv.sleep(Duration.ofHours(2))
+        eventually { assertEquals(1, activities.warnings.size) }
+        val w = activities.warnings[0]
+        assertAbout(t0 + 18 * HOUR_MS, w.atMs, "warning at 75% used")
+        assertAbout(t0 + 24 * HOUR_MS, w.dueAtMs, "warning carries the deadline")
+        assertEquals(75, w.percent)
+        assertEquals("srm-1", w.srmUserId)
+        assertTrue(ticket("t11").getWorkflowDiagnostics().slaWarningSent)
+
+        testEnv.sleep(Duration.ofHours(10))
+        eventually { assertEquals(1, activities.escalations.size) }
+        assertEquals(1, activities.warnings.size, "warned once only")
+        closeAndAwait("t11")
+    }
+
+    @Test
+    fun `a pause pushes the warning back and a ticket resolved first is never warned`() {
+        val t0 = startTicketWith("t12") { setSlaHoursApplied(24).setSlaWarningPercent(75) }
+        testEnv.sleep(Duration.ofHours(10))
+        ticket("t12").pauseSla(PauseSlaSignal.newBuilder().setActorId("officer-1").build())
+        testEnv.sleep(Duration.ofHours(2))
+        ticket("t12").resumeSla(ResumeSlaSignal.newBuilder().setActorId("officer-1").build())
+        testEnv.sleep(Duration.ofHours(7)) // 17h of SLA used
+        assertTrue(activities.warnings.isEmpty())
+        testEnv.sleep(Duration.ofHours(2))
+        eventually { assertEquals(1, activities.warnings.size) }
+        assertAbout(t0 + 20 * HOUR_MS, activities.warnings[0].atMs, "18h used plus the 2h pause")
+        closeAndAwait("t12")
+
+        startTicketWith("t13") { setSlaHoursApplied(24).setSlaWarningPercent(75) }
+        testEnv.sleep(Duration.ofHours(10))
+        setStatus("t13", "RESOLVED")
+        testEnv.sleep(Duration.ofHours(48))
+        assertEquals(1, activities.warnings.size, "no warning for t13, resolved before 18h")
+        closeAndAwait("t13")
+    }
+
+    @Test
+    fun `a warning the backend can't receive doesn't delay the breach`() {
+        activities.warningBackendDown = true
+        val t0 = startTicketWith("t14") { setSlaHoursApplied(4).setSlaWarningPercent(50) }
+
+        testEnv.sleep(Duration.ofHours(5))
+        eventually { assertEquals(1, activities.escalations.size) }
+        assertAbout(t0 + 4 * HOUR_MS, activities.escalations[0].atMs, "breach on time while the warning retries")
+        assertTrue(activities.warnings.isEmpty())
+
+        // Closing waits for the warning to be delivered, then ends
+        setStatus("t14", "CLOSED")
+        activities.warningBackendDown = false
+        WorkflowStub.fromTyped(ticket("t14")).getResult(Void::class.java)
+        assertEquals(1, activities.warnings.size)
+    }
+
+    // --- BA DFD-2: SLA calendar (F04), deadline computed by the backend ---
+
+    @Test
+    fun `runs to a business-time deadline sent by the backend`() {
+        val now = testEnv.currentTimeMillis()
+        startTicketWith("t15") { setSlaHoursApplied(0).setSlaDueAtEpochMs(now + 10 * HOUR_MS) }
+        eventually { assertAbout(now + 10 * HOUR_MS, ticket("t15").getWorkflowDiagnostics().slaDueAtEpochMs, "deadline as sent") }
+
+        testEnv.sleep(Duration.ofHours(9))
+        assertTrue(activities.escalations.isEmpty())
+        testEnv.sleep(Duration.ofHours(2))
+        eventually { assertEquals(1, activities.escalations.size) }
+        assertAbout(now + 10 * HOUR_MS, activities.escalations[0].atMs, "breach at the backend's deadline")
+        closeAndAwait("t15")
+    }
+
+    @Test
+    fun `a resume can carry a new business-time deadline`() {
+        val now = testEnv.currentTimeMillis()
+        startTicketWith("t16") { setSlaHoursApplied(0).setSlaDueAtEpochMs(now + 10 * HOUR_MS) }
+        testEnv.sleep(Duration.ofHours(2))
+        ticket("t16").pauseSla(PauseSlaSignal.newBuilder().setActorId("officer-1").build())
+        testEnv.sleep(Duration.ofHours(1))
+        // e.g. the pause ran into the weekend: the backend moves the deadline by 10h, not 1h
+        ticket("t16").resumeSla(
+            ResumeSlaSignal.newBuilder().setActorId("officer-1").setSlaDueAtEpochMs(now + 20 * HOUR_MS).build()
+        )
+
+        testEnv.sleep(Duration.ofHours(10)) // now+13h: past the old deadline, before the new one
+        assertTrue(activities.escalations.isEmpty())
+        testEnv.sleep(Duration.ofHours(8))
+        eventually { assertEquals(1, activities.escalations.size) }
+        assertAbout(now + 20 * HOUR_MS, activities.escalations[0].atMs, "breach at the new deadline")
+        closeAndAwait("t16")
+    }
+
+    // --- BA DFD-2: reopened tickets (2.5) ---
+
+    @Test
+    fun `reopening a resolved ticket continues its remaining SLA`() {
+        startTicketWith("t17") { setSlaHoursApplied(24) }
+        testEnv.sleep(Duration.ofHours(10))
+        setStatus("t17", "RESOLVED")
+        testEnv.sleep(Duration.ofHours(48))
+
+        setStatus("t17", "REOPENED")
+        val reopenedAt = testEnv.currentTimeMillis()
+        eventually {
+            val d = ticket("t17").getWorkflowDiagnostics()
+            assertEquals("REOPENED", d.currentStatus)
+            assertEquals(1, d.reopenCount)
+        }
+        testEnv.sleep(Duration.ofHours(13))
+        assertTrue(activities.escalations.isEmpty(), "14h were left when it was resolved")
+        testEnv.sleep(Duration.ofHours(2))
+        eventually { assertEquals(1, activities.escalations.size) }
+        assertAbout(reopenedAt + 14 * HOUR_MS, activities.escalations[0].atMs, "breach after the remaining 14h")
+        closeAndAwait("t17")
+    }
+
+    @Test
+    fun `reopening a breached ticket carries on up the escalation ladder`() {
+        startTicketWith("t18") { setSlaHoursApplied(1).addAllEscalationTierHours(listOf(4L, 8L)) }
+        testEnv.sleep(Duration.ofHours(2))
+        eventually { assertEquals(listOf(0), activities.escalations.map { it.tier }) }
+        setStatus("t18", "RESOLVED")
+        testEnv.sleep(Duration.ofHours(24))
+        assertEquals(1, activities.escalations.size, "nothing more while resolved")
+
+        setStatus("t18", "REOPENED")
+        val reopenedAt = testEnv.currentTimeMillis()
+        testEnv.sleep(Duration.ofHours(13))
+        eventually { assertEquals(listOf(0, 1, 2), activities.escalations.map { it.tier }) }
+        assertAbout(reopenedAt + 4 * HOUR_MS, activities.escalations[1].atMs, "tier 1 four hours after the reopen")
+        assertEquals("PAST_SLA", ticket("t18").getWorkflowDiagnostics().slaStatus)
+        closeAndAwait("t18")
+    }
+
+    @Test
+    fun `REOPENED is ignored unless the ticket is resolved`() {
+        startTicketWith("t19") { setSlaHoursApplied(24) }
+        setStatus("t19", "REOPENED")
+        testEnv.sleep(Duration.ofMinutes(1))
+        eventually {
+            val d = ticket("t19").getWorkflowDiagnostics()
+            assertEquals("RAISED", d.currentStatus)
+            assertEquals(0, d.reopenCount)
+        }
+        closeAndAwait("t19")
+    }
+
+    @Test
+    fun `a ticket reopened after closure carries on from its closed run`() {
+        val t0 = startTicketWith("t20") {
+            setSlaHoursApplied(24).setSlaWarningPercent(75).setReopened(
+                ReopenedTicketState.newBuilder()
+                    .setRemainingSlaSeconds(5 * HOUR_S).setTotalPausedSeconds(HOUR_S)
+                    .setReopenCount(1).setSlaWarningSent(true)
+            )
+        }
+        eventually {
+            val d = ticket("t20").getWorkflowDiagnostics()
+            assertEquals("REOPENED", d.currentStatus)
+            assertEquals(2, d.reopenCount)
+            assertEquals(HOUR_S, d.accumulatedPausedSeconds)
+        }
+        testEnv.sleep(Duration.ofHours(4))
+        assertTrue(activities.escalations.isEmpty())
+        testEnv.sleep(Duration.ofHours(2))
+        eventually { assertEquals(1, activities.escalations.size) }
+        assertAbout(t0 + 5 * HOUR_MS, activities.escalations[0].atMs, "breach after the 5h carried over")
+        assertTrue(activities.warnings.isEmpty(), "already warned before it was closed")
+        closeAndAwait("t20")
+
+        // Closed while breached at tier 0: the reopened run climbs to tier 1, without re-alerting the SRM
+        val t1 = startTicketWith("t21") {
+            setSlaHoursApplied(1).addAllEscalationTierHours(listOf(4L)).setReopened(
+                ReopenedTicketState.newBuilder().setSlaBreached(true).setEscalationTier(0).setReopenCount(0)
+            )
+        }
+        testEnv.sleep(Duration.ofHours(5))
+        eventually { assertEquals(listOf(0, 1), activities.escalations.map { it.tier }) }
+        assertAbout(t1 + 4 * HOUR_MS, activities.escalations[1].atMs, "tier 1 four hours after the reopen")
+        closeAndAwait("t21")
+    }
+
     // --- helpers ---
+
+    /** Starts a ticket with the newer optional fields set by [configure]. Returns the start time (ms). */
+    private fun startTicketWith(id: String, configure: TicketWorkflowInput.Builder.() -> Unit): Long {
+        val input = TicketWorkflowInput.newBuilder()
+            .setTicketId(id)
+            .setTicketNumber("RS-$id")
+            .setTicketType("SERVICE")
+            .setRegionCode("NRB")
+            .setBranchCode("001")
+            .setSrmUserId("srm-1")
+            .setReportedAtEpochMs(testEnv.currentTimeMillis())
+            .apply(configure)
+            .build()
+        val stub = client.newWorkflowStub(
+            TicketLifecycleWorkflow::class.java,
+            WorkflowOptions.newBuilder()
+                .setWorkflowId("ticket-$id")
+                .setTaskQueue(TicketLifecycleWorkflowImpl.TASK_QUEUE)
+                .build()
+        )
+        val startedAt = testEnv.currentTimeMillis()
+        WorkflowStub.fromTyped(stub).start(input)
+        return startedAt
+    }
 
     /** Starts a ticket workflow the same way the Go backend does. Returns the start time (ms). */
     private fun startTicket(id: String, slaHours: Long, tiers: List<Long> = emptyList()): Long {
@@ -271,9 +525,19 @@ class TicketLifecycleWorkflowTest {
 class RecordingActivities : TicketActivities {
     data class Escalation(val tier: Int, val atMs: Long, val pausedSecs: Long, val srmUserId: String, val ticketNumber: String)
     data class PauseSync(val totalPausedSeconds: Long, val actorId: String)
+    data class Warning(val percent: Int, val atMs: Long, val dueAtMs: Long, val srmUserId: String)
 
     val escalations = CopyOnWriteArrayList<Escalation>()
     val pauseSyncs = CopyOnWriteArrayList<PauseSync>()
+    val warnings = CopyOnWriteArrayList<Warning>()
+
+    /** When true, the paused-time report fails like a backend outage, and Temporal keeps retrying it. */
+    @Volatile
+    var backendDown = false
+
+    /** When true, the SLA warning call fails like a backend outage, and Temporal keeps retrying it. */
+    @Volatile
+    var warningBackendDown = false
 
     override fun recordAndNotifySlaEscalation(
         ticketId: String, ticketNumber: String, escalationTier: Int,
@@ -283,7 +547,16 @@ class RecordingActivities : TicketActivities {
         return "IN_PROGRESS"
     }
 
+    override fun recordSlaWarning(
+        ticketId: String, ticketNumber: String, srmUserId: String,
+        warningPercent: Int, warnedAtEpochMs: Long, slaDueAtEpochMs: Long
+    ) {
+        if (warningBackendDown) throw IllegalStateException("backend unavailable")
+        warnings += Warning(warningPercent, warnedAtEpochMs, slaDueAtEpochMs, srmUserId)
+    }
+
     override fun syncPausedDurationToBackend(ticketId: String, totalPausedSeconds: Long, actorId: String) {
+        if (backendDown) throw IllegalStateException("backend unavailable")
         pauseSyncs += PauseSync(totalPausedSeconds, actorId)
     }
 }

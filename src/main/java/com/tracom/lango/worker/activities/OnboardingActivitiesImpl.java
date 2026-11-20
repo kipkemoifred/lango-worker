@@ -10,8 +10,6 @@ import com.tracom.lango.proto.v1.DeclineOnboardingRequest;
 import com.tracom.lango.proto.v1.OnboardingCallbackResponse;
 import com.tracom.lango.proto.v1.OnboardingCallbackServiceGrpc;
 import com.tracom.lango.proto.v1.OnboardingStageOverdueRequest;
-import com.tracom.lango.proto.v1.ProvisionMerchantRequest;
-import com.tracom.lango.proto.v1.ProvisionMerchantResponse;
 
 import io.quarkiverse.temporal.TemporalActivity;
 import io.quarkus.grpc.GrpcClient;
@@ -38,6 +36,12 @@ public class OnboardingActivitiesImpl implements OnboardingActivities {
     @ConfigProperty(name = "lango.onboarding.compliance-deadline-hours")
     long complianceDeadlineHours;
 
+    @ConfigProperty(name = "lango.onboarding.inspection-deadline-hours")
+    long inspectionDeadlineHours;
+
+    @ConfigProperty(name = "lango.onboarding.inspection-approval-deadline-hours")
+    long inspectionApprovalDeadlineHours;
+
     @ConfigProperty(name = "lango.onboarding.ict-deadline-hours")
     long ictDeadlineHours;
 
@@ -52,7 +56,8 @@ public class OnboardingActivitiesImpl implements OnboardingActivities {
 
     @Override
     public OnboardingPolicy loadOnboardingPolicy() {
-        return new OnboardingPolicy(reviewDeadlineHours, complianceDeadlineHours, ictDeadlineHours,
+        return new OnboardingPolicy(reviewDeadlineHours, complianceDeadlineHours, inspectionDeadlineHours,
+                inspectionApprovalDeadlineHours, ictDeadlineHours,
                 amendmentDeadlineHours, List.copyOf(escalationTierHours), maxAmendmentCycles);
     }
 
@@ -104,24 +109,5 @@ public class OnboardingActivitiesImpl implements OnboardingActivities {
             throw ApplicationFailure.newFailure(
                     "Backend did not decline " + applicationId, "BACKEND_REJECTED");
         }
-    }
-
-    @Override
-    public ProvisionMerchantResponse provisionMerchant(String applicationId, String ticketId, String approvedByActorId) {
-        LOG.infof("Provisioning merchant for application=%s", applicationId);
-
-        ProvisionMerchantResponse response = goBackendClient
-                .withDeadlineAfter(CALL_DEADLINE_SECONDS, TimeUnit.SECONDS)
-                .provisionMerchant(ProvisionMerchantRequest.newBuilder()
-                        .setApplicationId(applicationId)
-                        .setTicketId(ticketId)
-                        .setApprovedByActorId(approvedByActorId)
-                        .build());
-
-        if (!response.getSuccess()) {
-            throw ApplicationFailure.newFailure(
-                    "Backend did not provision merchant for " + applicationId, "BACKEND_REJECTED");
-        }
-        return response;
     }
 }

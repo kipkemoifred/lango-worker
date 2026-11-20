@@ -11,6 +11,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import com.tracom.lango.proto.v1.RecordSlaBreachRequest;
+import com.tracom.lango.proto.v1.RecordSlaWarningRequest;
 import com.tracom.lango.proto.v1.TicketInternalCallbackServiceGrpc;
 import com.tracom.lango.worker.testsupport.FakeGoBackend;
 
@@ -76,6 +77,20 @@ class TicketActivitiesImplTest {
     }
 
     @Test
+    void warningIsSentToBackendWithAllFields() {
+        activities.recordSlaWarning("uuid-1", "RS10000000011772654400", "srm-7", 75, 1_772_654_400_000L, 1_772_676_000_000L);
+
+        assertEquals(1, backend.warnings.size());
+        RecordSlaWarningRequest w = backend.warnings.get(0);
+        assertEquals("uuid-1", w.getTicketId());
+        assertEquals("RS10000000011772654400", w.getTicketNumber());
+        assertEquals("srm-7", w.getSrmUserId());
+        assertEquals(75, w.getWarningPercent());
+        assertEquals(1_772_654_400_000L, w.getWarnedAtEpochMs());
+        assertEquals(1_772_676_000_000L, w.getSlaDueAtEpochMs());
+    }
+
+    @Test
     void backendRejectionThrowsARetryableFailure() {
         backend.rejectRequests = true;
 
@@ -86,6 +101,8 @@ class TicketActivitiesImplTest {
 
         assertThrows(ApplicationFailure.class,
                 () -> activities.syncPausedDurationToBackend("uuid-1", 60L, "officer-1"));
+        assertThrows(ApplicationFailure.class,
+                () -> activities.recordSlaWarning("uuid-1", "RS1", "srm-7", 75, 0L, 0L));
     }
 
     @Test

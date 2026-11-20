@@ -7,8 +7,6 @@ import com.tracom.lango.proto.v1.DeclineOnboardingRequest;
 import com.tracom.lango.proto.v1.OnboardingCallbackResponse;
 import com.tracom.lango.proto.v1.OnboardingCallbackServiceGrpc;
 import com.tracom.lango.proto.v1.OnboardingStageOverdueRequest;
-import com.tracom.lango.proto.v1.ProvisionMerchantRequest;
-import com.tracom.lango.proto.v1.ProvisionMerchantResponse;
 
 import io.grpc.stub.StreamObserver;
 
@@ -17,9 +15,8 @@ public class FakeOnboardingBackend extends OnboardingCallbackServiceGrpc.Onboard
 
     public final List<OnboardingStageOverdueRequest> overdueAlerts = new CopyOnWriteArrayList<>();
     public final List<DeclineOnboardingRequest> declines = new CopyOnWriteArrayList<>();
-    public final List<ProvisionMerchantRequest> provisions = new CopyOnWriteArrayList<>();
 
-    /** When true, the backend answers success=false, like a failed DB write or TMS call. */
+    /** When true, the backend answers success=false, like a failed DB write. */
     public volatile boolean rejectRequests = false;
 
     @Override
@@ -34,19 +31,6 @@ public class FakeOnboardingBackend extends OnboardingCallbackServiceGrpc.Onboard
             StreamObserver<OnboardingCallbackResponse> responseObserver) {
         declines.add(request);
         reply(responseObserver);
-    }
-
-    @Override
-    public void provisionMerchant(ProvisionMerchantRequest request,
-            StreamObserver<ProvisionMerchantResponse> responseObserver) {
-        provisions.add(request);
-        responseObserver.onNext(ProvisionMerchantResponse.newBuilder()
-                .setSuccess(!rejectRequests)
-                .setMerchantId("merchant-" + request.getApplicationId())
-                .setOutletId("outlet-" + request.getApplicationId())
-                .setMid("MID-" + request.getApplicationId())
-                .build());
-        responseObserver.onCompleted();
     }
 
     private void reply(StreamObserver<OnboardingCallbackResponse> responseObserver) {
